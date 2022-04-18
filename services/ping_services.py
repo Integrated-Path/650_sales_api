@@ -2,17 +2,19 @@
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 from odoo.addons.base_rest.components.service import to_int
 from odoo.addons.component.core import Component
-
+from odoo import fields
 
 class PingService(Component):
     _inherit = "base.rest.service"
     _name = "650_sales_api.service"
-    _usage = "650_sales_api"
-    _collection = "base.rest.demo.records.services"
+    _usage = "order_data"
+    _collection = "base.rest.gym.private.services"
     _description = """
         Ping Services
         Access to the ping services is allowed to everyone
     """
+    
+
 
     # The following method are 'public' and can be called from the controller.
     def get(self, _id, message):
@@ -38,15 +40,23 @@ class PingService(Component):
 
     # pylint:disable=method-required-super
     def create(self, **params):
+        print("testjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj")
         """
         Create method description ...
         """
+        
         records = []
         for data in params["data"]:
+            
+            partner_id = self.env['res.partner'].search(data["card_number"]) # search for res.partner record with cardnumber == data["card_number"]
+            if partner_id: #found
+                pass
+            else:
+                partner_id = '' # created new res.partner record with card_number = data["card_number"] and name = data["customer_name"]
+                
             record = self.env["sale.order"].sudo().create({
-                "partner_id": data["customer_id"],
+                "partner_id": partner_id.id,
                 "origin": data["card_number"],
-                "name": data["name"],
                 "date_order": data["date"],
                 "order_line": [
                     (0, 0, {
@@ -58,6 +68,7 @@ class PingService(Component):
                 ]
             })
             records.append(record.id)
+            
         return {"response": records}
 
     def delete(self, _id):

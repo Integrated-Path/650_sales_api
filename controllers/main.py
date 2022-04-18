@@ -12,11 +12,11 @@ class BaseRestDemoPublicApiController(main.RestController):
 
 class BaseRestDemoPrivateApiController(main.RestController):
     _root_path = "/650_sales_api/private/"
-    _collection_name = "base.rest.demo.private.services"
+    _collection_name = "base.rest.gym.private.services"
     _default_auth = "user"
 
 
 class BaseRestDemoNewApiController(main.RestController):
     _root_path = "/650_sales_api/"
-    _collection_name = "base.rest.demo.records.services"
+    _collection_name = "base.rest.gym.records.services"
     _default_auth = "public"
