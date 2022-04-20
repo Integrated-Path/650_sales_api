@@ -1,9 +1,7 @@
 # Copyright 2018 ACSONE SA/NV
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
-from odoo.addons.base_rest.components.service import to_int
 from odoo.addons.component.core import Component
-from odoo import fields
-from odoo.exceptions import UserError
+from odoo.exceptions import UserError, MissingError
 
 REQUIRED_CREATION_FIELDS = {"card_number", "partner_name", "smart_id", "date", "order_line", "cashier_name"}
 ALLOWED_ACTIONS = {"refund"}
@@ -39,25 +37,53 @@ class SaleRestApiService(Component):
                 pass
             else:
                 raise UserError(f"The Action {action_name} is not allowed")
-        
-        def validate_product_ids(product_ids: list()) -> None:
-            try:
-                product_ids = self.env["product.product"].browse(product_ids)
-            except Exception:
-                raise UserError("One of the product ID's does not exists")
 
-        def handle_refund_action(sale_id: object, product_ids: list) -> bool:
-            process_tranfer_return(sale_id, product_ids)
-            process_invoice_refund(sale_id)
+        def covert_poducts_ids_list_to_general_line_values(product_ids: list) -> list:
+            formated_values = {}
+            for product_id in product_ids:
+                if formated_values.get(product_id):
+                    formated_values[product_id]["quantity"] += 1
+                else:
+                    formated_values[product_id] = {
+                        "product_id": product_id,
+                        "quantity": 1
+                    }
+            return list(formated_values.values())
+
+        def validate_product_lines(product_lines: list, sale_id: object) -> None:
+            if len(product_lines) == 0:
+                raise UserError("No Product ID's were provided")
+            for product_line in product_lines:
+                product_int = product_line["product_id"]
+                product_qty = product_line["quantity"]
+                # using search() instead of browse() to handle no record found
+                product_id = self.env["product.product"].search([("id", "=", product_int)])
+                if len(product_id) == 0:
+                    raise UserError(f"No product with ID {product_int} was found")
+                line_id = sale_id.order_line.filtered(lambda x: x.product_id == product_id)
+                if len(line_id) == 0:
+                    raise UserError(f"The Product with ID {product_int} does not exist in registery")
+                elif len(line_id) == 1:
+                    if line_id.qty_delivered < product_qty:
+                        raise UserError(f"You are trying to refund more quantity for product with ID {product_int}, than what it is available")
+                    else:
+                        pass
+                else:
+                    raise UserError("Something went wrong, please contact the API support (EC: 400)")
+
+
+        def handle_refund_action(sale_id: object, product_lines: list) -> bool:
+            process_tranfer_return(sale_id, product_lines)
+            process_invoice_refund(sale_id, product_lines)
             sale_id.message_post(
                 body= "The Sale Order Was Refunded",
                 message_type='comment',
-                subtype_id = 'mail.mt_note',
+                subtype = 'mail.mt_note',
             )
 
-        def process_tranfer_return(sale_id: object, product_ids: list) -> object:
-            picking_ids = sale_id.picking_ids.filtered(lambda x: x.state == "done")
-            refund_line_values = tranfer_product_ids_to_stock_return_picking_line_values(product_ids, picking_ids)
+        def process_tranfer_return(sale_id: object, product_lines: list) -> object:
+            picking_ids = sale_id.picking_ids.filtered(lambda x: x.picking_type_code == "outgoing" and x.state == "done")
+            refund_line_values = convert_general_product_lines_to_return_line_values(product_lines, picking_ids)
             return_wizard_id = self.create_wizard_object(
                 wizard_name="stock.return.picking",
                 model_name="stock.picking",
@@ -67,31 +93,58 @@ class SaleRestApiService(Component):
                     "product_return_moves": refund_line_values
                 }
             )
-            return_tranfer_id = return_wizard_id._create_returns()[0]
+            return_tranfer_int = return_wizard_id._create_returns()[0]
             # changing `return_tranfer_id` from int to recor object
-            return_tranfer_id = self.env["stock.picking"].browse([return_tranfer_id])
+            return_tranfer_id = self.env["stock.picking"].browse([return_tranfer_int])
+            for stock_move in return_tranfer_id.move_lines:
+                stock_move.quantity_done = stock_move.product_uom_qty
             return_tranfer_id.button_validate()
             return return_tranfer_id
 
-        def process_invoice_refund(sale_id: object) -> object:
+        def convert_general_product_lines_to_return_line_values(product_lines: list, picking_id: object) -> list:
+            return_line_values = [(0, 0, {
+                "product_id": item["product_id"],
+                "quantity": item["quantity"],
+                "to_refund": True,
+                "move_id": fetch_related_stock_move_line_for_product(picking_id, item["product_id"] )
+            }) for item in product_lines]
+            return return_line_values
+
+        def fetch_related_stock_move_line_for_product(picking_id: object, product_id: int) -> object:
+            move_id = picking_id.move_lines.filtered(lambda x: x.product_id.id == product_id)
+            if len(move_id) == 0:
+                raise UserError(f"The product ID {product_id} was not found in the sale order")
+            elif len(move_id) == 1:
+                return move_id.id
+            else:
+                raise UserError("Something went wrong, please contact the API support (EC: 200)")
+
+        def process_invoice_refund(sale_id: object, product_lines: list) -> object:
             # ---- Invoice Refund ----
-            invoice_id = sale_id.invoice_ids.filtered(lambda x: x.state == "posted" and x.invoice_payment_state == "paid")
+            invoice_id = sale_id.invoice_ids.filtered(lambda x: x.type == "out_invoice" and x.state == "posted" and x.invoice_payment_state == "paid")
             if len(invoice_id) == 0:
-                return None
+                raise UserError("Something went wrong, please contact the API support (EC: 300)")
             elif len(invoice_id) == 1:
-                refund_invoice_id = self.create_wizard_object(
+                reverse_wizard_id = self.create_wizard_object(
                     wizard_name="account.move.reversal",
                     model_name="account.move",
                     record_ids=invoice_id.ids,
-                    values={}
+                    values={
+                        "refund_method": "refund"
+                    }
                 )
+                # This return a dictionary for odoo actions
+                reverse_result = reverse_wizard_id.reverse_moves()
+                refund_invoice_id = self.env["account.move"].browse([ reverse_result["res_id"] ])
+                to_update_account_move_line_values = convert_product_lines_to_account_move_lines(product_lines, refund_invoice_id)
+                refund_invoice_id.write({"invoice_line_ids": to_update_account_move_line_values})
                 refund_invoice_id.action_post()
                 payment_id = self.create_wizard_object(
                     wizard_name="account.payment",
-                    model_name="account.payment",
+                    model_name="account.move",
                     record_ids=refund_invoice_id.ids,
                     values={
-                        "payment_type": "inbound",
+                        "payment_type": "outbound",
                         "partner_type": "customer",
                         "partner_id": refund_invoice_id.partner_id.id,
                         "journal_id": refund_invoice_id.journal_id.id,
@@ -101,31 +154,21 @@ class SaleRestApiService(Component):
                 payment_id.post()
                 return payment_id
             else:
-                raise ("Something went wrong, please contact the API support (EC: 100)")
+                raise UserError("Something went wrong, please contact the API support (EC: 100)")
 
-        def tranfer_product_ids_to_stock_return_picking_line_values(product_ids: list, picking_id: object) -> list:
-            format_1 = {}
-            for product_id in product_ids:
-                if format_1.get(product_id):
-                    format_1[product_id]["quantity"] += 1
+        def convert_product_lines_to_account_move_lines(product_lines: list, account_move_id: object) -> list:
+            product_lines_list_to_dict = {item["product_id"]: item for item in product_lines}
+            move_lines_values = []
+            for move_line in account_move_id.invoice_line_ids:
+                if product_lines_list_to_dict.get(move_line.product_id.id):
+                    format_1_qty = product_lines_list_to_dict[move_line.product_id.id]["quantity"]
+                    if format_1_qty != move_line.quantity:
+                        move_lines_values.append((1, move_line.id, {"quantity": format_1_qty}))
+                    else:
+                        pass
                 else:
-                    format_1[product_id] = {
-                        "product_id": product_id,
-                        "quantity": 1,
-                        "to_refund": True,
-                        "move_id": fetch_related_stock_move_line_for_product(picking_id, product_id)
-                    }
-            format_2 = [(0, 0, item) for item in format_1.values()]
-            return format_2
-
-        def fetch_related_stock_move_line_for_product(picking_id: object, product_id: int) -> object:
-            move_id = picking_id.move_lines.filtered(lambda x: x.product_id.id == product_id)
-            if len(move_id) == 0:
-                raise UserError(f"The product ID {product_id} was not found in the sale order")
-            elif len(move_id) == 1:
-                return move_id.id
-            else:
-                raise ("Something went wrong, please contact the API support (EC: 200)")
+                    move_lines_values.append((3, move_line.id ))
+            return move_lines_values
 
         # =====================================================
 
@@ -133,10 +176,13 @@ class SaleRestApiService(Component):
         action = params.get("action", "")
         product_ids = params.get("product_ids", [])
         validate_action(action)
-        validate_product_ids(product_ids)
+        product_lines = covert_poducts_ids_list_to_general_line_values(product_ids)
+        # we are converting before validating because we need the convered value
+        # to do a proper validation
+        validate_product_lines(product_lines, sale_id)
         if action == "refund":
-            handle_refund_action(sale_id, product_ids)
-        return {"response": True}
+            handle_refund_action(sale_id, product_lines)
+        return {"is_success": True}
 
     def create(self, **params):
         # ================= INTERNAL FUNCTIONS =========================
@@ -185,7 +231,7 @@ class SaleRestApiService(Component):
         def create_and_confirm_transfer(sale_id: object) -> object:
             tranfer_id = sale_id.picking_ids
             tranfer_id.ensure_one()
-            for stock_move in tranfer_id.move_ids_without_package:
+            for stock_move in tranfer_id.move_lines:
                 stock_move.quantity_done = stock_move.product_uom_qty
             tranfer_id.button_validate()
             return tranfer_id
@@ -199,7 +245,7 @@ class SaleRestApiService(Component):
             move_id.ensure_one()
             payment_id = self.create_wizard_object(
                 wizard_name="account.payment",
-                model_name="account.payment",
+                model_name="account.move",
                 record_ids=move_id.ids,
                 values={
                     "payment_type": "inbound",
@@ -231,12 +277,11 @@ class SaleRestApiService(Component):
     def _validator_update(self):
         return {
             "action": {"type": "string"},
-            "sale_id": {"type": "string"},
             "product_ids": {"type": "list"}
         }
 
     def _validator_return_update(self):
-        return {"response": {"type": "boolean"}}
+        return {"is_success": {"type": "boolean"}}
 
     def _validator_create(self):
         return {"data": {"type": "list"}}
