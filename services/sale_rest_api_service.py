@@ -140,7 +140,7 @@ class SaleRestApiService(Component):
                 refund_invoice_id.write({"invoice_line_ids": to_update_account_move_line_values})
                 refund_invoice_id.action_post()
                 payment_id = self.create_wizard_object(
-                    wizard_name="account.payment",
+                    wizard_name="account.payment.register",
                     model_name="account.move",
                     record_ids=refund_invoice_id.ids,
                     values={
@@ -148,10 +148,9 @@ class SaleRestApiService(Component):
                         "partner_type": "customer",
                         "partner_id": refund_invoice_id.partner_id.id,
                         "journal_id": refund_invoice_id.journal_id.id,
-                        "payment_method_id": self.env.ref("account.account_payment_method_manual_in").id
                     }
                 )
-                payment_id.post()
+                payment_id.action_create_payments()
                 return payment_id
             else:
                 raise UserError("Something went wrong, please contact the API support (EC: 100)")
@@ -169,7 +168,6 @@ class SaleRestApiService(Component):
                 else:
                     move_lines_values.append((3, move_line.id ))
             return move_lines_values
-
         # =====================================================
 
         sale_id = get_sale_order(_id)
@@ -226,6 +224,7 @@ class SaleRestApiService(Component):
                 ]
             })
             sale_id.action_confirm()
+            sale_id.date_order = data["date"] # Confirming the sale order causes the reset of the `date_order` which is why we need to reenter the value again
             return sale_id
 
         def create_and_confirm_transfer(sale_id: object) -> object:
@@ -243,8 +242,8 @@ class SaleRestApiService(Component):
 
         def create_and_confirm_payment(move_id: object, partner_id: object, journal_id: object) -> object:
             move_id.ensure_one()
-            payment_id = self.create_wizard_object(
-                wizard_name="account.payment",
+            payment_wizard_id = self.create_wizard_object(
+                wizard_name="account.payment.register",
                 model_name="account.move",
                 record_ids=move_id.ids,
                 values={
@@ -252,11 +251,10 @@ class SaleRestApiService(Component):
                     "partner_type": "customer",
                     "partner_id": partner_id.id,
                     "journal_id": journal_id.id,
-                    "payment_method_id": self.env.ref("account.account_payment_method_manual_in").id
                 }
             )
-            payment_id.post()
-            return payment_id
+            payment_wizard_id.action_create_payments()
+            return payment_wizard_id
         # =====================================================
 
         records = []
